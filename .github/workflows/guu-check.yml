@@ -1,0 +1,105 @@
+name: GUU schedule — connectivity check
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/guu-check.yml'
+  schedule:
+    - cron: '7 4,17 * * *'
+permissions:
+  contents: read
+concurrency:
+  group: guu-schedule-check
+  cancel-in-progress: false
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check official schedule and Excel files
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import hashlib, io, os, re, urllib.request, urllib.error, zipfile
+          from html.parser import HTMLParser
+          from urllib.parse import urljoin, urlparse, unquote, quote
+          from datetime import datetime, timezone
+
+          PAGE = 'https://guu.ru/student/schedule/'
+          HEADERS = {'User-Agent': 'TeacherScheduleChecker/1.0', 'Accept': '*/*'}
+          LIMIT = 25 * 1024 * 1024
+          report = ['# GUU connectivity check', '', 'Checked: ' + datetime.now(timezone.utc).isoformat(), '']
+          def log(s):
+              print(s, flush=True)
+              report.append(s)
+          def official(url):
+              u = urlparse(url)
+              return u.scheme == 'https' and (u.hostname == 'guu.ru' or (u.hostname or '').endswith('.guu.ru'))
+          def get(url):
+              if not official(url):
+                  raise ValueError('Non-GUU URL')
+              req = urllib.request.Request(url, headers=HEADERS)
+              with urllib.request.urlopen(req, timeout=25) as response:
+                  if not official(response.geturl()):
+                      raise ValueError('Redirect outside GUU')
+                  data = response.read(LIMIT + 1)
+                  if len(data) > LIMIT:
+                      raise ValueError('Response too large')
+                  return response.status, response.headers.get_content_charset() or 'utf-8', data
+          class Links(HTMLParser):
+              def __init__(self):
+                  super().__init__()
+                  self.links = []
+              def handle_starttag(self, tag, attrs):
+                  if tag == 'a':
+                      href = dict(attrs).get('href') or ''
+                      url = urljoin(PAGE, href)
+                      if official(url) and unquote(urlparse(url).path).lower().endswith('.xlsx'):
+                          self.links.append(url)
+          links = []
+          page_ok = False
+          try:
+              status, encoding, body = get(PAGE)
+              p = Links()
+              p.feed(body.decode(encoding, errors='replace'))
+              links = list(dict.fromkeys(p.links))
+              page_ok = True
+              log(f'Official page: HTTP {status}; XLSX links: {len(links)}')
+          except Exception as e:
+              log(f'Official page unavailable: {e}')
+          # Known filenames are fallback probes only, not verified current sources.
+          fallback = [
+              '1-курс-бакалавриат-ОФО-9-2.xlsx',
+              '3-курс-бакалавриат-ОФО-10-2.xlsx',
+              '1-2-курс-магистратура-ОФО-3-3.xlsx',
+              '1-2-курс-магистратура-ОФО-1-2.xlsx',
+          ]
+          def relevance(url):
+              name = unquote(urlparse(url).path).lower()
+              return any(k in name for k in ('бакалавр','магист','сесс','расписан'))
+          candidates = [u for u in links if relevance(u)] or links
+          candidates = candidates[:12]
+          if not candidates:
+              candidates = ['https://guu.ru/wp-content/uploads/' + quote(f) for f in fallback]
+              log('Testing historical/possible direct paths only (not evidence of current semester).')
+          valid = 0
+          for url in candidates:
+              name = unquote(urlparse(url).path.rsplit('/', 1)[-1])
+              try:
+                  status, _, blob = get(url)
+                  with zipfile.ZipFile(io.BytesIO(blob)) as z:
+                      if 'xl/workbook.xml' not in z.namelist():
+                          raise ValueError('Not an Excel workbook')
+                  valid += 1
+                  log(f'- OK: {name} | HTTP {status} | {len(blob)} bytes | SHA256 {hashlib.sha256(blob).hexdigest()}')
+              except Exception as e:
+                  log(f'- FAILED: {name} | {e}')
+          log('')
+          log(f'Result: official page reachable={page_ok}; valid workbooks={valid}/{len(candidates)}.')
+          log('Diagnostic only. No schedule or repository files modified.')
+          with open(os.environ['GITHUB_STEP_SUMMARY'], 'a', encoding='utf-8') as out:
+              out.write('\n'.join(report) + '\n')
+          if not page_ok or not valid:
+              raise SystemExit(1)
+          PY
